@@ -1,0 +1,203 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import classification_report, roc_curve, auc, precision_recall_curve, average_precision_score
+import matplotlib.pyplot as plt
+from pytorch_tabnet.tab_model import TabNetClassifier
+import torch
+
+# Step 1: Load the Data
+df = pd.read_csv("diabetes_binary_5050split_health_indicators_BRFSS2015.csv")
+df.rename(columns={'Diabetes_binary': 'Diabetes'}, inplace=True)
+
+# Step 2: Data Preprocessing
+prune_features = ['Diabetes']
+X = df.drop(columns=prune_features)
+y = df['Diabetes']
+
+# Normalize features using Min-Max Scaling
+scaler = MinMaxScaler()
+X = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+
+# Step 3: Split the Data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1, stratify=y)
+X_train2, X_valid, y_train2, y_valid = train_test_split(X_train, y_train, test_size=0.25, random_state=1, stratify=y_train)
+
+# Convert data to numpy arrays for TabNet
+X_train2_np, y_train2_np = X_train2.values, y_train2.values
+X_valid_np, y_valid_np = X_valid.values, y_valid.values
+X_test_np, y_test_np = X_test.values, y_test.values
+
+# Step 4: Define TabNet Model
+tabnet_clf = TabNetClassifier(
+    n_d=16,  # Width of the decision prediction layer (can tune)
+    n_a=16,  # Width of the attention layer (can tune)
+    n_steps=5,  # Number of steps in the architecture
+    gamma=1.5,  # Relaxation parameter to control feature reuse
+    n_independent=2,  # Number of independent Gated Linear Units
+    n_shared=2,  # Number of shared Gated Linear Units
+    lambda_sparse=0.001,  # Sparse regularization strength
+    optimizer_fn=torch.optim.Adam,  # Optimizer function
+    optimizer_params=dict(lr=2e-3),  # Learning rate for optimizer
+    scheduler_params={"step_size":10, "gamma":0.9},  # Learning rate scheduler params
+    scheduler_fn=torch.optim.lr_scheduler.StepLR,  # Learning rate scheduler
+    mask_type="entmax"  # Masking function ("sparsemax" or "entmax")
+)
+
+# Step 5: Train the Model
+tabnet_clf.fit(
+    X_train2_np, y_train2_np,
+    eval_set=[(X_valid_np, y_valid_np)],
+    eval_name=["valid"],
+    eval_metric=["accuracy", "balanced_accuracy"],
+    max_epochs=50,
+    patience=10,
+    batch_size=1024,
+    virtual_batch_size=256,
+    weights=1,  # Balanced weights can be used here
+    drop_last=False
+)
+
+# Step 6: Evaluate the Model on Test Set
+y_pred_prob = tabnet_clf.predict_proba(X_test_np)[:, 1]
+y_pred_labels = (y_pred_prob > 0.8).astype(int)  # Applying threshold of 0.7
+
+# Print Classification Report
+print("TabNet Model Evaluation with Threshold of 0.8:")
+print(classification_report(y_test_np, y_pred_labels))
+
+# Step 7: Plot ROC Curve
+fpr, tpr, _ = roc_curve(y_test_np, y_pred_prob)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(8, 3))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = {:.2f})'.format(roc_auc))
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc="lower right")
+plt.grid()
+plt.show()
+
+# Step 8: Plot Precision-Recall Curve
+precision, recall, _ = precision_recall_curve(y_test_np, y_pred_prob)
+pr_auc = average_precision_score(y_test_np, y_pred_prob)
+
+plt.figure(figsize=(8, 3))
+plt.plot(recall, precision, color="b", linewidth=2, label=f'PR AUC = {pr_auc:.2f}')
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision-Recall Curve")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Step 9: Extract Feature Importance from TabNet
+feature_importances = tabnet_clf.feature_importances_
+
+# Plotting Feature Importance
+import matplotlib.pyplot as plt
+
+# Create a DataFrame to pair feature names with their importance scores
+feature_importance_df = pd.DataFrame({
+    'Feature': X.columns,
+    'Importance': feature_importances
+}).sort_values(by='Importance', ascending=False)
+
+# Display the feature importance dataframe
+print("Feature Importances (Descending Order):")
+print(feature_importance_df)
+
+# Plot feature importances
+plt.figure(figsize=(10, 6))
+plt.barh(feature_importance_df['Feature'], feature_importance_df['Importance'], color='skyblue')
+plt.xlabel('Importance Score')
+plt.title('Feature Importance in TabNet Model')
+plt.gca().invert_yaxis()  # To have the highest importance at the top
+plt.grid()
+plt.show()
+
+# Step 10: Analyzing Feature Importance
+# We can decide on a cutoff threshold for keeping the most important features
+# Here, we choose the top 10 most important features (this can be adjusted)
+top_features = feature_importance_df['Feature'][:10].tolist()
+
+# Step 11: Select Important Features and Prepare Data Again
+X_top_features = X[top_features]  # Selecting only the top features from the dataset
+
+# Re-split the data
+X_train, X_test, y_train, y_test = train_test_split(X_top_features, y, test_size=0.25, random_state=1, stratify=y)
+X_train2, X_valid, y_train2, y_valid = train_test_split(X_train, y_train, test_size=0.25, random_state=1, stratify=y_train)
+
+# Convert data to numpy arrays for TabNet
+X_train2_np, y_train2_np = X_train2.values, y_train2.values
+X_valid_np, y_valid_np = X_valid.values, y_valid.values
+X_test_np, y_test_np = X_test.values, y_test.values
+
+# Step 12: Retrain TabNet Model with Selected Features
+# Define TabNet Model
+tabnet_clf_reduced = TabNetClassifier(
+    n_d=16,  # Same parameters as before
+    n_a=16,
+    n_steps=5,
+    gamma=1.5,
+    n_independent=2,
+    n_shared=2,
+    lambda_sparse=0.001,
+    optimizer_fn=torch.optim.Adam,
+    optimizer_params=dict(lr=2e-3),
+    scheduler_params={"step_size":10, "gamma":0.9},
+    scheduler_fn=torch.optim.lr_scheduler.StepLR,
+    mask_type="entmax"
+)
+
+# Train the reduced model
+tabnet_clf_reduced.fit(
+    X_train2_np, y_train2_np,
+    eval_set=[(X_valid_np, y_valid_np)],
+    eval_name=["valid"],
+    eval_metric=["accuracy", "balanced_accuracy"],
+    max_epochs=50,
+    patience=10,
+    batch_size=1024,
+    virtual_batch_size=256,
+    weights=1,  # Balanced weights
+    drop_last=False
+)
+
+# Step 13: Evaluate the Model on Test Set
+y_pred_prob_reduced = tabnet_clf_reduced.predict_proba(X_test_np)[:, 1]
+y_pred_labels_reduced = (y_pred_prob_reduced > 0.6).astype(int)
+
+# Print Classification Report for Reduced Model
+print("TabNet Model Evaluation with Selected Features and Threshold of 0.6:")
+print(classification_report(y_test_np, y_pred_labels_reduced))
+
+# Plot ROC Curve for the Reduced Model
+fpr_reduced, tpr_reduced, _ = roc_curve(y_test_np, y_pred_prob_reduced)
+roc_auc_reduced = auc(fpr_reduced, tpr_reduced)
+
+plt.figure(figsize=(8, 3))
+plt.plot(fpr_reduced, tpr_reduced, color='darkorange', lw=2, label='ROC curve (area = {:.2f})'.format(roc_auc_reduced))
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve After Feature Selection')
+plt.legend(loc="lower right")
+plt.grid()
+plt.show()
+
+# Precision-Recall Curve for the Reduced Model
+precision_reduced, recall_reduced, _ = precision_recall_curve(y_test_np, y_pred_prob_reduced)
+pr_auc_reduced = average_precision_score(y_test_np, y_pred_prob_reduced)
+
+plt.figure(figsize=(8, 3))
+plt.plot(recall_reduced, precision_reduced, color="b", linewidth=2, label=f'PR AUC = {pr_auc_reduced:.2f}')
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision-Recall Curve After Feature Selection")
+plt.legend()
+plt.grid()
+plt.show()
