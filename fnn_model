@@ -1,0 +1,192 @@
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import classification_report
+from sklearn.utils.class_weight import compute_class_weight
+from imblearn.combine import SMOTEENN
+from keras.models import Sequential
+from keras.layers import Dense, Dropout, Input, BatchNormalization
+from keras.optimizers import Adam
+from keras.regularizers import l2
+from keras.callbacks import EarlyStopping, LearningRateScheduler
+from tensorflow.keras.utils import to_categorical
+from keras.layers import LeakyReLU
+
+# Step 1: Load the Data
+df = pd.read_csv("diabetes_binary_5050split_health_indicators_BRFSS2015.csv")
+df.rename(columns={'Diabetes_binary': 'Diabetes'}, inplace=True)
+
+# Step 2: Data Preprocessing
+prune_features = ['Diabetes']
+X = df.drop(columns=prune_features)
+y = df['Diabetes']
+
+# Normalize features using Min-Max Scaling
+scaler = MinMaxScaler()
+X = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+
+# Step 3: Split the Data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=1, stratify=y)
+X_train2, X_valid, y_train2, y_valid = train_test_split(X_train, y_train, test_size=0.25, random_state=1, stratify=y_train)
+
+# Step 4: Handle Class Imbalance with SMOTEENN
+smote_enn = SMOTEENN(random_state=42)
+X_resampled, y_resampled = smote_enn.fit_resample(X_train2, y_train2)
+
+# Step 5: Adjust Class Weights to Prevent Overcompensation
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train2), y=y_train2)
+class_weights = dict(enumerate(class_weights))
+# Make further adjustments to balance precision and recall
+class_weights[0] *= 1.5  # Increase importance of class 0
+class_weights[1] *= 0.5  # Decrease the emphasis on class 1
+
+# Step 6: Convert Labels to Categorical Format for Keras Model
+n_classes = len(np.unique(y))
+y_resampled_c = to_categorical(y_resampled, n_classes)
+y_valid_c = to_categorical(y_valid, n_classes)
+y_test_c = to_categorical(y_test, n_classes)
+
+# Step 7: Build a Simpler Neural Network Model with Improvements
+model = Sequential([
+    Input(shape=(X_resampled.shape[1],)),  # Define the input shape as the first layer
+    Dense(16, kernel_regularizer=l2(0.02)),
+    BatchNormalization(),  # Add Batch Normalization to help stabilize training
+    LeakyReLU(negative_slope=0.01),  # Use LeakyReLU to prevent dying ReLU issue
+    Dropout(0.3),
+    Dense(32, kernel_regularizer=l2(0.02)),
+    BatchNormalization(),
+    LeakyReLU(negative_slope=0.01),
+    Dropout(0.3),
+    Dense(n_classes, activation='softmax')
+])
+
+# Define Hybrid Loss Function (combines Focal Loss and Cross-Entropy)
+def hybrid_loss(alpha=0.25, gamma=2., cross_entropy_weight=0.7):
+    def loss(y_true, y_pred):
+        # Focal Loss Part
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1. - epsilon)
+        y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+        alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        fl = - alpha_t * tf.pow((1 - p_t), gamma) * tf.math.log(p_t)
+        focal_loss = tf.reduce_mean(fl)
+
+        # Cross-Entropy Part
+        cross_entropy = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+
+        # Hybrid Loss: Weighted Sum of Both
+        return cross_entropy_weight * cross_entropy + (1 - cross_entropy_weight) * focal_loss
+
+    return loss
+
+# Step 8: Compile the Model with Hybrid Loss
+model.compile(
+    loss=hybrid_loss(alpha=0.25, gamma=2., cross_entropy_weight=0.5),
+    optimizer=Adam(learning_rate=0.0001),
+    metrics=['accuracy', 'recall']
+)
+
+# Step 9: Define Callbacks (Early Stopping and Learning Rate Scheduler)
+early_stopping_recall = EarlyStopping(monitor='val_recall', mode='max', patience=5, restore_best_weights=True)
+early_stopping_loss = EarlyStopping(monitor='val_loss', mode='min', patience=5, restore_best_weights=True)
+early_stopping_accuracy = EarlyStopping(monitor='val_accuracy', mode='max', patience=5, restore_best_weights=True)
+
+def scheduler(epoch, lr):
+    if epoch < 10:
+        return float(lr)
+    else:
+        return float(lr * tf.math.exp(-0.1))
+
+lr_scheduler = LearningRateScheduler(scheduler)
+
+# Resample validation set to match training characteristics
+X_valid_resampled, y_valid_resampled = smote_enn.fit_resample(X_valid, y_valid)
+y_valid_resampled_c = to_categorical(y_valid_resampled, n_classes)
+
+# Step 10: Train the Model with Early Stopping and Learning Rate Scheduling
+history = model.fit(
+    X_resampled, y_resampled_c,
+    batch_size=128,
+    epochs=50,
+    verbose=1,
+    validation_data=(X_valid_resampled, y_valid_resampled_c),
+    class_weight=class_weights,
+    callbacks=[early_stopping_recall, early_stopping_loss, early_stopping_accuracy, lr_scheduler]
+)
+
+# Step 11: Adjust Decision Threshold and Evaluate the Model
+threshold = 0.7  # Further increased threshold to improve precision for class 1
+y_pred_prob = model.predict(X_test)
+y_pred_labels = (y_pred_prob[:, 1] > threshold).astype(int)
+
+# Print classification report
+print("Neural Network Model Evaluation with Adjusted Weights, Threshold, and SMOTEENN:")
+print(classification_report(y_test, y_pred_labels))
+
+# Step 12: Plot Training History
+
+# ROC Curve
+from sklearn.metrics import roc_curve, auc
+
+y_pred = model.predict(X_test)
+y_scores = y_pred[:, 1]
+fpr, tpr, _ = roc_curve(y_test, y_scores)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(8, 3))
+plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = {:.2f})'.format(roc_auc))
+plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve at Threshold = {:.2f}'.format(threshold))
+plt.legend(loc="lower right")
+plt.grid()
+plt.show()
+
+# Precision-Recall Curve
+from sklearn.metrics import precision_recall_curve, average_precision_score
+
+y_scores = y_pred[:, 1]
+precision, recall, _ = precision_recall_curve(y_test, y_scores)
+pr_auc = average_precision_score(y_test, y_scores)
+
+plt.figure(figsize=(8, 3))
+plt.plot(recall, precision, color="b", linewidth=2, label=f'PR AUC = {pr_auc:.2f}')
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Precision-Recall Curve at Threshold = {:.2f}".format(threshold))
+plt.legend()
+plt.grid()
+plt.show()
+
+# Plot training and validation loss
+plt.figure(figsize=(8, 6))
+
+# Loss plot
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Training Loss', color='blue')
+plt.plot(history.history['val_loss'], label='Validation Loss', color='orange')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Loss Over Epochs at Threshold = {:.2f}'.format(threshold))
+plt.legend()
+
+# Accuracy plot
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy', color='orange')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Accuracy Over Epochs at Threshold = {:.2f}'.format(threshold))
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+
